@@ -1,0 +1,161 @@
+description: |
+  Read-heavy (90% read / 10% write) benchmark for the reflinks_tokenmeta table, runnable against
+  Astra DB (secure connect bundle) or open-source Cassandra (host/localdc). The keyspace must already exist.
+  Table schema represents token metadata with a composite partition key ((type, scope, name), version),
+  secondary indexes on alias and name, and timestamp/boolean/UUID attributes.
+
+  Index flavor is selected with index_type=sai|legacy (Astra requires sai; Cassandra 4.x requires legacy).
+
+scenarios:
+  default:
+    table: run driver=cql tags==block:schema_table threads==1 cycles==UNDEF
+    index: run driver=cql tags==block:schema_index_TEMPLATE(index_type,sai) threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,100000) threads===TEMPLATE(rampup-threads,auto)
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,200000) threads===TEMPLATE(main-threads,auto) rate===TEMPLATE(main-rate,auto)
+  basic_check:
+    table: run driver=cql tags==block:schema_table threads==1 cycles==UNDEF
+    index: run driver=cql tags==block:schema_index_TEMPLATE(index_type,sai) threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10) threads=auto
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10) threads=auto
+  schema:
+    table: run driver=cql tags==block:schema_table threads==1 cycles==UNDEF
+    index: run driver=cql tags==block:schema_index_TEMPLATE(index_type,sai) threads==1 cycles==UNDEF
+  rampup:
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,100000) threads===TEMPLATE(rampup-threads,auto)
+  main:
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,200000) threads===TEMPLATE(main-threads,auto) rate===TEMPLATE(main-rate,auto)
+  verify:
+    verify: run driver=cql tags==block:verify cycles===TEMPLATE(verify-cycles,100) threads=1
+  truncate:
+    truncate: run driver=cql tags==block:truncate threads==1 cycles==UNDEF
+  cleanup:
+    cleanup: run driver=cql tags==block:cleanup threads==1 cycles==UNDEF
+
+params:
+  instrument: TEMPLATE(instrument-all,false)
+
+bindings:
+  # Composite partition key bindings (deterministic, bounded by keycount for 100% read hit rate)
+  type: Mod(TEMPLATE(keycount,1000000)); Hash(); Mod(10); ToString(); Prefix('type_')
+  scope: Mod(TEMPLATE(keycount,1000000)); Hash(); Mod(20); ToString(); Prefix('scope_')
+  name: Mod(TEMPLATE(keycount,1000000)); ToString(); Prefix('token_name_')
+
+  # Clustering key
+  version: Mod(TEMPLATE(keycount,1000000)); Hash(); Mod(5); ToString(); Prefix('v')
+
+  # Secondary index column
+  alias: Mod(TEMPLATE(keycount,1000000)); ToString(); Prefix('alias_')
+
+  # Timestamps (Java driver 4.x maps CQL TIMESTAMP to java.time.Instant)
+  createdts: StartingEpochMillis('2024-01-01 00:00:00'); ToJavaInstant() -> java.time.Instant
+  deletedts: StartingEpochMillis('2024-06-01 00:00:00'); ToJavaInstant() -> java.time.Instant
+  expiryts: StartingEpochMillis('2025-01-01 00:00:00'); ToJavaInstant() -> java.time.Instant
+
+  # Boolean flag
+  deleted: Mod(TEMPLATE(keycount,1000000)); Hash(); Mod(2); ToBoolean() -> java.lang.Boolean
+
+  # Target UUID
+  target: Mod(TEMPLATE(keycount,1000000)); ToHashedUUID() -> java.util.UUID
+
+blocks:
+  schema_table:
+    params:
+      prepared: false
+    ops:
+      create_table: |
+        CREATE TABLE IF NOT EXISTS TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta) (
+          type text,
+          scope text,
+          name text,
+          version text,
+          alias text,
+          createdts timestamp,
+          deleted boolean,
+          deletedts timestamp,
+          expiryts timestamp,
+          target uuid,
+          PRIMARY KEY ((type, scope, name), version)
+        ) WITH CLUSTERING ORDER BY (version ASC);
+
+  # Storage-Attached Indexes: Astra DB and Cassandra 5.0+
+  schema_index_sai:
+    params:
+      prepared: false
+    ops:
+      create_index_alias: |
+        CREATE CUSTOM INDEX IF NOT EXISTS TEMPLATE(table,reflinks_tokenmeta)_by_alias
+        ON TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta) (alias) USING 'StorageAttachedIndex';
+      create_index_name: |
+        CREATE CUSTOM INDEX IF NOT EXISTS TEMPLATE(table,reflinks_tokenmeta)_by_name
+        ON TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta) (name) USING 'StorageAttachedIndex';
+
+  # Legacy secondary indexes: Cassandra 4.x (also available on 5.0)
+  schema_index_legacy:
+    params:
+      prepared: false
+    ops:
+      create_index_alias: |
+        CREATE INDEX IF NOT EXISTS TEMPLATE(table,reflinks_tokenmeta)_by_alias
+        ON TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta) (alias);
+      create_index_name: |
+        CREATE INDEX IF NOT EXISTS TEMPLATE(table,reflinks_tokenmeta)_by_name
+        ON TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta) (name);
+
+  truncate:
+    params:
+      prepared: false
+    ops:
+      truncate_table: |
+        TRUNCATE TABLE TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta);
+
+  rampup:
+    params:
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      idempotent: true
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument-all,false))
+    ops:
+      insert_rampup: |
+        INSERT INTO TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta)
+        (type, scope, name, version, alias, createdts, deleted, deletedts, expiryts, target)
+        VALUES ({type}, {scope}, {name}, {version}, {alias}, {createdts}, {deleted}, {deletedts}, {expiryts}, {target});
+
+  verify:
+    params:
+      ratio: 1
+      cl: TEMPLATE(read_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-reads,TEMPLATE(instrument-all,false))
+    ops:
+      select_verify: |
+        SELECT type, scope, name, version, alias, createdts, deleted, deletedts, expiryts, target
+        FROM TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta)
+        WHERE type = {type} AND scope = {scope} AND name = {name} AND version = {version};
+
+  main_read:
+    params:
+      ratio: TEMPLATE(read_ratio,9)
+      cl: TEMPLATE(read_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-reads,TEMPLATE(instrument-all,false))
+    ops:
+      select_read: |
+        SELECT type, scope, name, version, alias, createdts, deleted, deletedts, expiryts, target
+        FROM TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta)
+        WHERE type = {type} AND scope = {scope} AND name = {name} AND version = {version};
+
+  main_write:
+    params:
+      ratio: TEMPLATE(write_ratio,1)
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      idempotent: true
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument-all,false))
+    ops:
+      insert_main: |
+        INSERT INTO TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta)
+        (type, scope, name, version, alias, createdts, deleted, deletedts, expiryts, target)
+        VALUES ({type}, {scope}, {name}, {version}, {alias}, {createdts}, {deleted}, {deletedts}, {expiryts}, {target});
+
+  cleanup:
+    params:
+      prepared: false
+    ops:
+      drop_table: |
+        DROP TABLE IF EXISTS TEMPLATE(keyspace,pix).TEMPLATE(table,reflinks_tokenmeta);

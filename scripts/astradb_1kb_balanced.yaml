@@ -1,0 +1,123 @@
+description: |
+  Astra DB (Cassandra) balanced 50/50 read-write benchmark with ~1KB row size.
+  Each row contains a UUID key, timestamp, status, sequence number, and ~950 byte text payload
+  totaling ~1KB per row.
+
+scenarios:
+  default:
+    schema: run driver=cql tags==block:schema_astra threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,100000) threads===TEMPLATE(rampup-threads,auto)
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,200000) threads===TEMPLATE(main-threads,auto) rate===TEMPLATE(main-rate,auto)
+  astra:
+    schema: run driver=cql tags==block:schema_astra threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,100000) threads===TEMPLATE(rampup-threads,auto)
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,200000) threads===TEMPLATE(main-threads,auto) rate===TEMPLATE(main-rate,auto)
+  basic_check:
+    schema: run driver=cql tags==block:schema_astra threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10) threads=auto
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10) threads=auto
+  schema:
+    schema: run driver=cql tags==block:schema_astra threads==1 cycles==UNDEF
+  rampup:
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,100000) threads===TEMPLATE(rampup-threads,auto)
+  main:
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,200000) threads===TEMPLATE(main-threads,auto) rate===TEMPLATE(main-rate,auto)
+  verify:
+    verify: run driver=cql tags==block:verify cycles===TEMPLATE(verify-cycles,100) threads=1
+  truncate:
+    truncate: run driver=cql tags==block:truncate threads==1 cycles==UNDEF
+  cleanup:
+    cleanup: run driver=cql tags==block:cleanup threads==1 cycles==UNDEF
+
+params:
+  instrument: TEMPLATE(instrument-all,false)
+
+bindings:
+  # Deterministic UUID partition key bounded by keycount for 100% read hits against written keys
+  id: Mod(TEMPLATE(keycount,1000000)); ToHashedUUID() -> java.util.UUID
+  
+  # Temporal metadata (Java driver 4.x maps CQL TIMESTAMP to java.time.Instant)
+  created_at: StartingEpochMillis('2024-01-01 00:00:00'); ToJavaInstant() -> java.time.Instant
+  
+  # Discrete categorical status
+  status: WeightedStrings('ACTIVE:70;INACTIVE:20;PENDING:10;')
+  
+  # Integer sequence / index (CQL INT maps to 32-bit int)
+  seq_num: HashRange(0, 1000000); ToInt() -> int
+  
+  # ~950 bytes alphanumeric string to achieve ~1KB total CQL row size with metadata
+  data: AlphaNumericString(TEMPLATE(payload_size,950))
+
+blocks:
+  schema_astra:
+    params:
+      prepared: false
+    ops:
+      create_table_astra: |
+        CREATE TABLE IF NOT EXISTS TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench) (
+          id uuid,
+          created_at timestamp,
+          status text,
+          seq_num int,
+          data text,
+          PRIMARY KEY (id)
+        );
+
+  truncate:
+    params:
+      prepared: false
+    ops:
+      truncate_table: |
+        TRUNCATE TABLE TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench);
+
+  rampup:
+    params:
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      idempotent: true
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument-all,false))
+    ops:
+      insert_rampup: |
+        INSERT INTO TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench)
+        (id, created_at, status, seq_num, data)
+        VALUES ({id}, {created_at}, {status}, {seq_num}, {data});
+
+  verify:
+    params:
+      ratio: 1
+      cl: TEMPLATE(read_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-reads,TEMPLATE(instrument-all,false))
+    ops:
+      select_verify: |
+        SELECT id, created_at, status, seq_num, data
+        FROM TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench)
+        WHERE id = {id};
+
+  main_read:
+    params:
+      ratio: TEMPLATE(read_ratio,5)
+      cl: TEMPLATE(read_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-reads,TEMPLATE(instrument-all,false))
+    ops:
+      select_read: |
+        SELECT id, created_at, status, seq_num, data
+        FROM TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench)
+        WHERE id = {id};
+
+  main_write:
+    params:
+      ratio: TEMPLATE(write_ratio,5)
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      idempotent: true
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument-all,false))
+    ops:
+      insert_main: |
+        INSERT INTO TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench)
+        (id, created_at, status, seq_num, data)
+        VALUES ({id}, {created_at}, {status}, {seq_num}, {data});
+
+  cleanup:
+    params:
+      prepared: false
+    ops:
+      drop_table: |
+        DROP TABLE IF EXISTS TEMPLATE(keyspace,default_keyspace).TEMPLATE(table,astradb_1kb_bench);

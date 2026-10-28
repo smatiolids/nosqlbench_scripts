@@ -1,0 +1,5 @@
+logs/*
+metrics/*
+scripts/logs/*
+.bob
+nosqlbench/*
